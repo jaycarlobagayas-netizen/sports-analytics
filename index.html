@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#0a0608" />
+  <title>Tournament Prediction System</title>
+  <meta name="description" content="Elo, Monte Carlo, Bayesian and ML sports forecasting — a simplified 538-style engine. MSU BPED theme." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+  <style>
+    html, body { margin: 0; background: #0a0608; }
+    @keyframes shimmer { 0%{opacity:.5} 50%{opacity:1} 100%{opacity:.5} }
+    @keyframes fadeUp { from{opacity:0; transform:translateY(10px)} to{opacity:1; transform:translateY(0)} }
+    .skel { animation: shimmer 1.4s ease-in-out infinite; }
+    .fade { animation: fadeUp .45s cubic-bezier(.22,1,.36,1) both; }
+    .stagger > * { animation: fadeUp .5s cubic-bezier(.22,1,.36,1) both; }
+    .stagger > *:nth-child(1){animation-delay:.02s} .stagger > *:nth-child(2){animation-delay:.06s}
+    .stagger > *:nth-child(3){animation-delay:.10s} .stagger > *:nth-child(4){animation-delay:.14s}
+    .stagger > *:nth-child(5){animation-delay:.18s} .stagger > *:nth-child(6){animation-delay:.22s}
+    .stagger > *:nth-child(7){animation-delay:.26s} .stagger > *:nth-child(8){animation-delay:.30s}
+    * { scrollbar-width: thin; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.3.1",
+      "react-dom": "https://esm.sh/react-dom@18.3.1",
+      "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
+      "recharts": "https://esm.sh/recharts@2.12.7?external=react,react-dom",
+      "lucide-react": "https://esm.sh/lucide-react@0.383.0?external=react"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module" data-presets="react">
+    import React, { useState, useEffect, useMemo, createContext, useContext } from "react";
+    import {
+      BarChart3, GitBranch, Brain, Trophy, TrendingUp, Plus, X,
+      Crown, Users, Play, RefreshCw,
+    } from "lucide-react";
+    import {
+      BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
+    } from "recharts";
+    import { createRoot } from "react-dom/client";
+
+    /* ===== math helpers ===== */
+    const sigmoid = (z) => 1 / (1 + Math.exp(-z));
+    const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+    const std = (a, m) => Math.sqrt(mean(a.map((v) => (v - m) * (v - m))) || 1);
+    const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0);
+    const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+    function randn() { let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+    function gammaSample(k) {
+      if (k < 1) return gammaSample(1 + k) * Math.pow(Math.random(), 1 / k);
+      const d = k - 1 / 3, c = 1 / Math.sqrt(9 * d);
+      while (true) { let x, v; do { x = randn(); v = 1 + c * x; } while (v <= 0); v = v * v * v; const u = Math.random();
+        if (u < 1 - 0.0331 * x * x * x * x) return d * v; if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v; }
+    }
+    const betaSample = (a, b) => { const x = gammaSample(a), y = gammaSample(b); return x / (x + y); };
+
+    const games = (t) => Math.max(0, (+t.w || 0) + (+t.l || 0));
+    const winPct = (t) => (games(t) > 0 ? (+t.w || 0) / games(t) : 0.5);
+    const margin = (t) => (+t.pf || 0) - (+t.pa || 0);
+
+    function seedElo(t) {
+      const winComp = (winPct(t) - 0.5) * 600;
+      const pdComp = clamp(margin(t), -20, 20) * 8;
+      const formComp = ((+t.form || 0) / 5 - 0.5) * 80;
+      return 1500 + winComp + pdComp + formComp;
+    }
+    const eloWinProb = (rA, rB, home = 0) => 1 / (1 + Math.pow(10, (rB - (rA + home)) / 400));
+    function bayesPosterior(t, pg = 4, pr = 0.5) {
+      const a = pr * pg + (+t.w || 0), b = (1 - pr) * pg + (+t.l || 0), m = a / (a + b);
+      const sd = Math.sqrt((a * b) / ((a + b) * (a + b) * (a + b + 1)));
+      return { a, b, mean: m, sd, lo: clamp(m - 1.96 * sd, 0, 1), hi: clamp(m + 1.96 * sd, 0, 1) };
+    }
+    const bayesMatchup = (pA, pB, hl = 0) => { const base = (pA * (1 - pB)) / (pA * (1 - pB) + pB * (1 - pA) || 1e-9); return sigmoid(Math.log(base / (1 - base) + 1e-9) + hl); };
+    function mlFeatures(A, B, home) { return [(seedElo(A) - seedElo(B)) / 400, winPct(A) - winPct(B), (margin(A) - margin(B)) / 10, ((+A.form || 0) - (+B.form || 0)) / 5, home]; }
+    function trainLogistic() {
+      const N = 3000, FN = ["Elo gap", "Win% gap", "Pt-diff gap", "Form gap", "Home"]; const X = [], y = [];
+      for (let i = 0; i < N; i++) {
+        const sA = randn() * 0.8, sB = randn() * 0.8, eloA = 1500 + sA * 250, eloB = 1500 + sB * 250, home = [-1, 0, 1][Math.floor(Math.random() * 3)];
+        const trueP = 1 / (1 + Math.pow(10, (eloB - (eloA + home * 60)) / 400)); y.push(Math.random() < trueP ? 1 : 0);
+        X.push([(eloA - eloB) / 400 + randn() * 0.12, (sA - sB) * 0.18 + randn() * 0.05, ((sA - sB) * 6) / 10 + randn() * 0.08, (sA - sB) * 0.16 + randn() * 0.06, home]);
+      }
+      const means = [], stds = []; for (let j = 0; j < 5; j++) { const col = X.map((r) => r[j]); const m = mean(col); means.push(m); stds.push(std(col, m)); }
+      const Xs = X.map((r) => r.map((v, j) => (v - means[j]) / stds[j])); let w = [0, 0, 0, 0, 0], b = 0; const lr = 0.3, iters = 600;
+      for (let it = 0; it < iters; it++) { const gw = [0, 0, 0, 0, 0]; let gb = 0;
+        for (let i = 0; i < N; i++) { const err = sigmoid(dot(w, Xs[i]) + b) - y[i]; for (let j = 0; j < 5; j++) gw[j] += err * Xs[i][j]; gb += err; }
+        for (let j = 0; j < 5; j++) w[j] -= (lr * gw[j]) / N; b -= (lr * gb) / N; }
+      let correct = 0, ll = 0; for (let i = 0; i < N; i++) { const p = sigmoid(dot(w, Xs[i]) + b); if ((p > 0.5 ? 1 : 0) === y[i]) correct++; ll += -(y[i] * Math.log(p + 1e-9) + (1 - y[i]) * Math.log(1 - p + 1e-9)); }
+      return { w, b, means, stds, acc: correct / N, logloss: ll / N, names: FN };
+    }
+    function mlPredict(model, A, B, home) { const f = mlFeatures(A, B, home); const z = f.reduce((acc, v, j) => acc + model.w[j] * ((v - model.means[j]) / model.stds[j]), model.b); return sigmoid(z); }
+    function matchupProb(model, mlModel, posts, A, B, home = 0) {
+      if (model === "elo") return eloWinProb(seedElo(A), seedElo(B), home * 65);
+      if (model === "ml") return mlPredict(mlModel, A, B, home);
+      return bayesMatchup(posts[A.id].mean, posts[B.id].mean, home * 0.4);
+    }
+    function seedOrder(n) { let s = [1, 2]; while (s.length < n) { const sum = s.length * 2 + 1, nx = []; for (const x of s) { nx.push(x); nx.push(sum - x); } s = nx; } return s; }
+    function seededBracket(teams) { const sorted = [...teams].sort((a, b) => seedElo(b) - seedElo(a)); return seedOrder(teams.length).map((s) => sorted[s - 1]); }
+    const stageName = (m) => ({ 16: "Round of 16", 8: "Quarterfinals", 4: "Semifinals", 2: "Final", 1: "Champion" }[m] || `${m} left`);
+    function runSimulation(teams, model, mlModel, nSims) {
+      const n = teams.length, R = Math.log2(n), order = seededBracket(teams), posts = {};
+      teams.forEach((t) => (posts[t.id] = bayesPosterior(t)));
+      const fixed = {};
+      if (model !== "bayes") teams.forEach((Aa) => { fixed[Aa.id] = {}; teams.forEach((Bb) => { if (Aa.id !== Bb.id) fixed[Aa.id][Bb.id] = matchupProb(model, mlModel, posts, Aa, Bb, 0); }); });
+      const adv = {}; teams.forEach((t) => (adv[t.id] = new Array(R + 1).fill(0)));
+      for (let s = 0; s < nSims; s++) {
+        let rate = null; if (model === "bayes") { rate = {}; teams.forEach((t) => (rate[t.id] = betaSample(posts[t.id].a, posts[t.id].b))); }
+        let alive = order.slice(); const wins = {}; teams.forEach((t) => (wins[t.id] = 0));
+        while (alive.length > 1) { const next = [];
+          for (let i = 0; i < alive.length; i += 2) { const Aa = alive[i], Bb = alive[i + 1];
+            const pA = model === "bayes" ? bayesMatchup(rate[Aa.id], rate[Bb.id], 0) : fixed[Aa.id][Bb.id];
+            const winner = Math.random() < pA ? Aa : Bb; wins[winner.id] += 1; next.push(winner); } alive = next; }
+        teams.forEach((t) => { for (let k = 1; k <= wins[t.id]; k++) adv[t.id][k] += 1; });
+      }
+      const stages = []; for (let m = n / 2; m >= 1; m /= 2) stages.push({ m, name: stageName(m), wins: R - Math.log2(m) });
+      const rows = teams.map((t) => { const r = { id: t.id, name: t.name, color: t.color }; stages.forEach((st) => (r[st.name] = (adv[t.id][st.wins] / nSims) * 100)); r.champ = (adv[t.id][R] / nSims) * 100; return r; });
+      rows.sort((a, b) => b.champ - a.champ); return { rows, stages, nSims, posts };
+    }
+    function simOneBracket(teams, model, mlModel) {
+      const posts = {}; teams.forEach((t) => (posts[t.id] = bayesPosterior(t))); let alive = seededBracket(teams); const rounds = [];
+      while (alive.length > 1) { const matchups = [], next = [];
+        for (let i = 0; i < alive.length; i += 2) { const Aa = alive[i], Bb = alive[i + 1]; const pA = matchupProb(model, mlModel, posts, Aa, Bb, 0); const winner = Math.random() < pA ? Aa : Bb; matchups.push({ A: Aa, B: Bb, pA, winnerId: winner.id }); next.push(winner); } rounds.push(matchups); alive = next; }
+      return { rounds, champion: alive[0] };
+    }
+
+    /* ===== theme ===== */
+    const T = { app: "#0a0608", surface: "#150d11", alt: "#20141a", border: "#2c1d24", text: "#f6ede2", sub: "#bb9ca4", faint: "#7c5f68" };
+    const A = { maroon: "#97193a", maroonDeep: "#6f0f29", gold: "#e0b13c", red: "#d9554e" };
+    const PALETTE = ["#97193a", "#2aa198", "#2fa36b", "#e0b13c", "#7d2a46", "#d9554e", "#c77d3a", "#1f8a70"];
+    const DEFAULT = [
+      { name: "Falcons", w: 58, l: 24, pf: 115.2, pa: 108.1, form: 4 }, { name: "Sharks", w: 54, l: 28, pf: 112.8, pa: 107.5, form: 3 },
+      { name: "Wolves", w: 51, l: 31, pf: 110.5, pa: 106.9, form: 5 }, { name: "Comets", w: 49, l: 33, pf: 109.8, pa: 108.0, form: 2 },
+      { name: "Titans", w: 47, l: 35, pf: 108.2, pa: 107.1, form: 3 }, { name: "Ravens", w: 45, l: 37, pf: 107.0, pa: 107.8, form: 2 },
+      { name: "Bears", w: 43, l: 39, pf: 106.1, pa: 107.5, form: 1 }, { name: "Foxes", w: 41, l: 41, pf: 105.0, pa: 106.9, form: 3 },
+    ].map((t, i) => ({ ...t, id: i + 1, color: PALETTE[i % 8] }));
+    const ML = { elo: "Elo", ml: "Machine Learning", bayes: "Bayesian" };
+    const VALID_N = [2, 4, 8, 16];
+    function Eyebrow({ children }) { return <div className="flex items-center gap-1.5 mb-1.5 text-xs font-semibold tracking-widest uppercase" style={{ color: A.gold }}><span>✦</span>{children}</div>; }
+    function Card({ children, className = "", style = {} }) { return <div className={`rounded-2xl border ${className}`} style={{ background: T.surface, borderColor: T.border, ...style }}>{children}</div>; }
+
+    function App() {
+      const [teams, setTeams] = useState(DEFAULT);
+      const [tab, setTab] = useState("teams");
+      const [model, setModel] = useState("elo");
+      const [nSims, setNSims] = useState(10000);
+      const [running, setRunning] = useState(false);
+      const [results, setResults] = useState(null);
+      const [bracket, setBracket] = useState(null);
+      const [mlModel, setMlModel] = useState(null);
+      useEffect(() => { setMlModel(trainLogistic()); }, []);
+      const n = teams.length, validN = VALID_N.includes(n);
+      const posts = useMemo(() => { const p = {}; teams.forEach((t) => (p[t.id] = bayesPosterior(t))); return p; }, [teams]);
+      const upd = (i, k, v) => setTeams((ts) => ts.map((t, j) => (j === i ? { ...t, [k]: v } : t)));
+      const add = () => setTeams((ts) => [...ts, { id: Math.max(0, ...ts.map((t) => t.id)) + 1, name: `Team ${ts.length + 1}`, w: 0, l: 0, pf: 100, pa: 100, form: 0, color: PALETTE[ts.length % 8] }]);
+      const del = (i) => setTeams((ts) => ts.filter((_, j) => j !== i));
+      const run = () => { if (!validN || !mlModel) return; setRunning(true); setResults(null);
+        setTimeout(() => { setResults(runSimulation(teams, model, mlModel, nSims)); setBracket(simOneBracket(teams, model, mlModel)); setRunning(false); setTab("results"); }, 30); };
+      const TABS = [["teams", "Teams & Run", Users], ["results", "Results", BarChart3], ["bracket", "Bracket", GitBranch], ["insights", "Insights", Brain]];
+      return (
+        <div className="min-h-screen" style={{ background: T.app, color: T.text }}>
+          <header className="sticky top-0 z-10 border-b backdrop-blur" style={{ background: T.surface + "e6", borderColor: T.border }}>
+            <div className="max-w-5xl mx-auto px-4 md:px-6 h-16 flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl flex items-center justify-center" style={{ background: `linear-gradient(135deg, ${A.maroonDeep}, ${A.gold})` }}><Trophy size={18} className="text-white" /></div>
+              <div><div className="font-bold text-sm leading-tight">Tournament Predictor</div><div className="text-xs" style={{ color: A.gold }}>Fostering excellence</div></div>
+              <div className="ml-auto flex gap-1">
+                {TABS.map(([k, label, Icon]) => (
+                  <button key={k} onClick={() => setTab(k)} className="px-3 py-1.5 text-xs md:text-sm font-medium rounded-xl flex items-center gap-1.5 transition-all"
+                    style={tab === k ? { background: A.maroon + "22", color: A.gold } : { color: T.sub }}><Icon size={15} /><span className="hidden sm:inline">{label}</span></button>
+                ))}
+              </div>
+            </div>
+          </header>
+          <main className="max-w-5xl mx-auto p-4 md:p-6 lg:p-8">
+            <div className="mb-4 text-xs rounded-xl px-3 py-2" style={{ background: A.gold + "14", color: A.gold, border: `1px solid ${A.gold}33` }}>
+              ⚠️ Probabilities, not certainties — a 75% favorite still loses 1 in 4 times.
+            </div>
+            {tab === "teams" && <TeamsRun {...{ teams, upd, add, del, setTeams, validN, n, model, setModel, nSims, setNSims, run, running }} />}
+            {tab === "results" && <Results results={results} running={running} />}
+            {tab === "bracket" && <BracketView bracket={bracket} model={model} mlModel={mlModel} teams={teams} setBracket={setBracket} />}
+            {tab === "insights" && <Insights teams={teams} posts={posts} mlModel={mlModel} />}
+          </main>
+        </div>
+      );
+    }
+
+    function TeamsRun({ teams, upd, add, del, setTeams, validN, n, model, setModel, nSims, setNSims, run, running }) {
+      return (
+        <div className="space-y-5 fade">
+          <div><Eyebrow>Team Records</Eyebrow><h1 className="text-2xl font-bold tracking-tight">Teams &amp; simulation</h1>
+            <p className="text-sm" style={{ color: T.sub }}>Edit records, choose a model, and run thousands of bracket simulations.</p></div>
+          <Card className="p-4 overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead><tr className="text-left" style={{ color: T.sub }}>
+                <th className="py-2 pr-2">Team</th><th className="px-2">W</th><th className="px-2">L</th><th className="px-2">Pts For</th><th className="px-2">Pts Ag.</th><th className="px-2">Form</th><th className="px-2">Elo</th><th></th></tr></thead>
+              <tbody>{teams.map((t, i) => (
+                <tr key={t.id} style={{ borderTop: `1px solid ${T.border}` }}>
+                  <td className="py-1.5 pr-2"><div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full" style={{ background: t.color }} />
+                    <input value={t.name} onChange={(e) => upd(i, "name", e.target.value)} className="w-24 px-2 py-1 rounded-lg outline-none" style={{ background: T.app, border: `1px solid ${T.border}`, color: T.text }} /></div></td>
+                  {["w", "l", "pf", "pa", "form"].map((k) => (<td key={k} className="px-1"><input type="number" value={t[k]} onChange={(e) => upd(i, k, e.target.value)} className="w-16 px-2 py-1 rounded-lg outline-none" style={{ background: T.app, border: `1px solid ${T.border}`, color: T.text }} /></td>))}
+                  <td className="px-2 font-mono" style={{ color: T.sub }}>{Math.round(seedElo(t))}</td>
+                  <td><button onClick={() => del(i)} style={{ color: T.faint }}><X size={15} /></button></td>
+                </tr>))}</tbody>
+            </table>
+            <div className="flex items-center gap-3 mt-3 text-sm">
+              <button onClick={add} className="px-3 py-1.5 rounded-lg flex items-center gap-1.5" style={{ background: T.alt }}><Plus size={14} />Add team</button>
+              <button onClick={() => setTeams(DEFAULT)} className="px-3 py-1.5 rounded-lg" style={{ background: T.alt }}>Reset</button>
+              <span className="text-xs" style={{ color: validN ? T.faint : A.red }}>{validN ? "Auto-seeded by Elo." : `Need 2, 4, 8 or 16 teams (have ${n}).`}</span>
+            </div>
+          </Card>
+          <Card className="p-5">
+            <div className="flex flex-wrap items-end gap-4">
+              <div><div className="text-xs mb-1" style={{ color: T.sub }}>Model</div><div className="flex gap-1">
+                {Object.keys(ML).map((m) => (<button key={m} onClick={() => setModel(m)} className="px-3 py-1.5 text-sm rounded-lg" style={model === m ? { background: A.maroon, color: "#fff" } : { background: T.alt, color: T.sub }}>{ML[m]}</button>))}
+              </div></div>
+              <div><div className="text-xs mb-1" style={{ color: T.sub }}>Simulations</div>
+                <select value={nSims} onChange={(e) => setNSims(+e.target.value)} className="px-2 py-1.5 text-sm rounded-lg outline-none" style={{ background: T.alt, color: T.text }}>
+                  {[1000, 5000, 10000, 25000, 50000].map((v) => <option key={v} value={v}>{v.toLocaleString()}</option>)}</select></div>
+              <button onClick={run} disabled={!validN || running} className="px-5 py-2 rounded-xl font-medium text-white flex items-center gap-2 disabled:opacity-40" style={{ background: `linear-gradient(135deg, ${A.maroon}, ${A.maroonDeep})` }}>
+                {running ? <RefreshCw size={16} className="animate-spin" /> : <Play size={16} />}{running ? "Simulating…" : "Run simulation"}</button>
+            </div>
+            {model === "bayes" && <p className="text-xs mt-2" style={{ color: T.faint }}>Bayesian mode resamples each team's win-rate from its posterior every run.</p>}
+          </Card>
+        </div>
+      );
+    }
+
+    function Results({ results, running }) {
+      if (running) return <div className="text-center py-16 text-sm fade" style={{ color: T.sub }}>Running simulations…</div>;
+      if (!results) return <div className="text-center py-16 text-sm" style={{ color: T.faint }}>Run a simulation from the <b style={{ color: T.text }}>Teams &amp; Run</b> tab.</div>;
+      return (
+        <div className="space-y-5 fade">
+          <div><Eyebrow>Prediction Output</Eyebrow><h1 className="text-2xl font-bold tracking-tight">Results</h1>
+            <p className="text-sm" style={{ color: T.sub }}>{results.nSims.toLocaleString()} simulations · ranked by championship probability</p></div>
+          <Card className="p-5">
+            <div className="text-sm font-semibold mb-3">Championship probability</div>
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={results.rows} margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke={T.border} /><XAxis dataKey="name" tick={{ fontSize: 11, fill: T.sub }} /><YAxis unit="%" tick={{ fontSize: 11, fill: T.sub }} />
+                <Tooltip formatter={(v) => `${v.toFixed(1)}%`} contentStyle={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 12, color: T.text }} />
+                <Bar dataKey="champ" radius={[4, 4, 0, 0]}>{results.rows.map((r) => <Cell key={r.id} fill={r.color} />)}</Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </Card>
+          <Card className="p-5 overflow-x-auto">
+            <div className="text-sm font-semibold mb-3">Advancement probabilities</div>
+            <table className="w-full text-sm">
+              <thead><tr className="text-left" style={{ color: T.sub }}><th className="py-1.5 pr-3">Team</th>{results.stages.map((s) => <th key={s.name} className="px-3 text-right">{s.name}</th>)}</tr></thead>
+              <tbody>{results.rows.map((r, i) => (
+                <tr key={r.id} style={{ borderTop: `1px solid ${T.border}`, background: i === 0 ? A.gold + "12" : "transparent" }}>
+                  <td className="py-1.5 pr-3"><span className="inline-flex items-center gap-2"><span className="w-2.5 h-2.5 rounded-full" style={{ background: r.color }} />{r.name}</span></td>
+                  {results.stages.map((s) => <td key={s.name} className="px-3 text-right font-mono">{r[s.name].toFixed(1)}%</td>)}
+                </tr>))}</tbody>
+            </table>
+          </Card>
+        </div>
+      );
+    }
+
+    function BracketView({ bracket, model, mlModel, teams, setBracket }) {
+      if (!bracket) return <div className="text-center py-16 text-sm" style={{ color: T.faint }}>Run a simulation to view a bracket.</div>;
+      return (
+        <div className="space-y-5 fade">
+          <div className="flex items-end justify-between flex-wrap gap-3">
+            <div><Eyebrow>Knockout Stage</Eyebrow><h1 className="text-2xl font-bold tracking-tight">Simulated bracket</h1>
+              <p className="text-sm" style={{ color: T.sub }}>One random playthrough under the {ML[model]} model</p></div>
+            <button onClick={() => setBracket(simOneBracket(teams, model, mlModel))} className="px-3 py-1.5 rounded-lg text-sm flex items-center gap-1.5" style={{ background: T.alt }}><RefreshCw size={14} />Re-roll</button>
+          </div>
+          <Card className="p-6 overflow-x-auto">
+            <div className="flex gap-4 min-w-max">
+              {bracket.rounds.map((rnd, ri) => (
+                <div key={ri} className="flex flex-col justify-around gap-3">
+                  <div className="text-xs text-center mb-1" style={{ color: T.faint }}>{stageName(teams.length / Math.pow(2, ri))}</div>
+                  {rnd.map((m, mi) => (
+                    <div key={mi} className="rounded-xl border overflow-hidden w-40 text-xs" style={{ borderColor: T.border }}>
+                      {[m.A, m.B].map((tm) => { const won = m.winnerId === tm.id; return (
+                        <div key={tm.id} className="flex items-center justify-between px-2.5 py-1.5" style={won ? { background: tm.color + "22" } : {}}>
+                          <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full" style={{ background: tm.color }} /><span style={{ color: won ? T.text : T.faint, fontWeight: won ? 700 : 400 }}>{tm.name}</span></span></div>); })}
+                    </div>))}
+                </div>))}
+              <div className="flex flex-col justify-center">
+                <div className="text-xs text-center mb-1" style={{ color: T.faint }}>Champion</div>
+                <div className="rounded-2xl p-4 text-center" style={{ background: `linear-gradient(135deg, ${A.maroon}, ${A.gold})`, color: "#1a0d05" }}><Crown size={20} className="mx-auto mb-1" /><div className="font-bold">{bracket.champion.name}</div></div>
+              </div>
+            </div>
+          </Card>
+        </div>
+      );
+    }
+
+    function Insights({ teams, posts, mlModel }) {
+      const [aId, setAId] = useState(teams[0]?.id), [bId, setBId] = useState(teams[1]?.id);
+      const A_ = teams.find((t) => t.id === +aId), B_ = teams.find((t) => t.id === +bId);
+      const cmp = A_ && B_ && A_.id !== B_.id && mlModel ? { elo: eloWinProb(seedElo(A_), seedElo(B_), 0), ml: mlPredict(mlModel, A_, B_, 0), bayes: bayesMatchup(posts[A_.id].mean, posts[B_.id].mean, 0) } : null;
+      return (
+        <div className="space-y-5 fade">
+          <div><Eyebrow>Model Transparency</Eyebrow><h1 className="text-2xl font-bold tracking-tight">Model insights</h1>
+            <p className="text-sm" style={{ color: T.sub }}>Compare how each model reads the same matchup — and what the ML learned.</p></div>
+          <Card className="p-5">
+            <div className="flex flex-wrap items-center gap-2 text-sm mb-4">
+              <select value={aId} onChange={(e) => setAId(+e.target.value)} className="px-2 py-1 rounded-lg" style={{ background: T.alt, color: T.text }}>{teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+              <span style={{ color: T.faint }}>vs</span>
+              <select value={bId} onChange={(e) => setBId(+e.target.value)} className="px-2 py-1 rounded-lg" style={{ background: T.alt, color: T.text }}>{teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+            </div>
+            {cmp && (<>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={[{ m: "Elo", p: cmp.elo * 100 }, { m: "Machine Learning", p: cmp.ml * 100 }, { m: "Bayesian", p: cmp.bayes * 100 }]} margin={{ top: 5, right: 10, left: -10, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} /><XAxis dataKey="m" tick={{ fontSize: 11, fill: T.sub }} /><YAxis unit="%" domain={[0, 100]} tick={{ fontSize: 11, fill: T.sub }} />
+                  <Tooltip formatter={(v) => `${v.toFixed(1)}%`} contentStyle={{ background: T.surface, border: `1px solid ${T.border}`, borderRadius: 12, color: T.text }} />
+                  <Bar dataKey="p" name={`${A_.name} win %`} fill={A.maroon} radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+              <p className="text-xs mt-3" style={{ color: T.sub }}>Bayesian 95% credible interval — {A_.name}: {(posts[A_.id].lo * 100).toFixed(0)}–{(posts[A_.id].hi * 100).toFixed(0)}%, {B_.name}: {(posts[B_.id].lo * 100).toFixed(0)}–{(posts[B_.id].hi * 100).toFixed(0)}%. Wider = less data = more uncertainty.</p>
+            </>)}
+          </Card>
+          {mlModel && (
+            <Card className="p-5">
+              <div className="text-sm font-semibold mb-1">What the ML model learned</div>
+              <p className="text-xs mb-3" style={{ color: T.sub }}>Standardized coefficients · accuracy {(mlModel.acc * 100).toFixed(1)}% · log-loss {mlModel.logloss.toFixed(3)}</p>
+              <div className="space-y-1.5">{mlModel.names.map((nm, i) => { const w = mlModel.w[i], mx = Math.max(...mlModel.w.map(Math.abs)); return (
+                <div key={nm} className="flex items-center gap-2 text-sm"><span className="w-24" style={{ color: T.sub }}>{nm}</span>
+                  <div className="flex-1 rounded h-4" style={{ background: T.alt }}><div className="h-4 rounded" style={{ width: `${(Math.abs(w) / mx) * 100}%`, background: w >= 0 ? A.maroon : A.red }} /></div>
+                  <span className="w-14 text-right font-mono text-xs">{w.toFixed(2)}</span></div>); })}</div>
+            </Card>
+          )}
+        </div>
+      );
+    }
+
+    createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
