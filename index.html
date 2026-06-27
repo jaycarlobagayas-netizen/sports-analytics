@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="theme-color" content="#0b0b0d" />
-  <title>World Cup 2026 Predictor — BPEd</title>
-  <meta name="description" content="Live FIFA World Cup 2026 standings + auto-generated knockout prediction (Elo, Bayesian, ML, Monte Carlo). BPEd themed." />
+  <title>World Cup 2026 Predictor v3 — BPEd</title>
+  <meta name="description" content="Live WC 2026 standings + PSO-calibrated win probabilities (shrinkage, Platt scaling, reliability diagram) + Monte Carlo. BPEd themed." />
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
   <style>
@@ -13,6 +13,7 @@
     @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
     .fade{animation:fadeUp .45s cubic-bezier(.22,1,.36,1) both}
     *{scrollbar-width:thin}
+    input[type=range]{accent-color:#e3b23c}
   </style>
   <script type="importmap">
   {"imports":{
@@ -29,19 +30,12 @@
   <script type="text/babel" data-type="module" data-presets="react">
     import React, { useState, useEffect, useMemo, useCallback } from "react";
     import { createRoot } from "react-dom/client";
-    import { Swords, BarChart3, Trophy, Crown, Wifi, WifiOff, Bot, RefreshCw, Info, Zap } from "lucide-react";
-    import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from "recharts";
+    import { Swords, BarChart3, Trophy, Crown, Wifi, WifiOff, Bot, RefreshCw, Info, Zap, Target, ToggleLeft, ToggleRight } from "lucide-react";
+    import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell, Legend, ReferenceLine } from "recharts";
 
-    /* ════════════════════════════════════════════════════════════════
-       LIVE DATA SOURCE — ESPN public API (no key, CORS-enabled).
-       Falls back to the embedded snapshot if the fetch/parse fails.
-       To swap providers, change API_URL and parseLive() only.
-       ════════════════════════════════════════════════════════════════ */
+    /* ════ LIVE DATA (ESPN public API, keyless, CORS) + snapshot fallback ════ */
     const API_URL = "https://site.api.espn.com/apis/v2/sports/soccer/fifa.world/standings";
-    const REFRESH_MS = 120000; // self-update every 2 minutes
-
-    /* Fallback snapshot — FIFA WC 2026 group stage, 24 Jun 2026.
-       Row: [group, name, abbr, wins, draws, losses, goalsFor?, goalsAgainst?] */
+    const REFRESH_MS = 120000;
     const SNAPSHOT_DATE = "June 24, 2026";
     const SNAPSHOT = [
       ["A","Mexico","MEX",2,0,0],["A","Korea Republic","KOR",1,0,1],["A","Czechia","CZE",0,1,1],["A","South Africa","RSA",0,1,1],
@@ -57,38 +51,19 @@
       ["K","Portugal","POR",1,1,0],["K","Colombia","COL",1,1,0],["K","Congo DR","COD",0,2,0],["K","Uzbekistan","UZB",0,0,2],
       ["L","England","ENG",1,1,0],["L","Ghana","GHA",1,1,0],["L","Croatia","CRO",1,0,1],["L","Panama","PAN",0,0,2],
     ];
-    const GROUP_C = { A:"#a8313f",B:"#e3b23c",C:"#ee7a3c",D:"#2aa198",E:"#6f9f3f",F:"#b3803a",G:"#8c1d2c",H:"#d4a017",I:"#cd6133",J:"#4f7bb0",K:"#9a6a8a",L:"#3f9f6f" };
-    const gc = (g) => GROUP_C[g] || "#b3803a";
+    const GROUP_C={A:"#a8313f",B:"#e3b23c",C:"#ee7a3c",D:"#2aa198",E:"#6f9f3f",F:"#b3803a",G:"#8c1d2c",H:"#d4a017",I:"#cd6133",J:"#4f7bb0",K:"#9a6a8a",L:"#3f9f6f"};
+    const gc=g=>GROUP_C[g]||"#b3803a";
+    const HOSTS=new Set(["USA","CAN","MEX"]);
+    function parseLive(json){try{const groups=json.children||(json.standings?[json]:[]);const rows=[];for(const grp of groups){const rawName=grp.abbreviation||grp.shortName||grp.name||"?";const g=String(rawName).replace(/^group\s*/i,"").trim().charAt(0).toUpperCase()||"?";const entries=(grp.standings&&grp.standings.entries)||grp.entries||[];for(const e of entries){const team=e.team||{};const name=team.shortDisplayName||team.displayName||team.name||team.abbreviation||"?";const abbr=String(team.abbreviation||name).slice(0,3).toUpperCase();const stat=(...ns)=>{for(const n of ns){const s=(e.stats||[]).find(x=>x.name===n||x.type===n||x.abbreviation===n);if(s&&s.value!=null)return Number(s.value);}return undefined;};const w=stat("wins")??0,l=stat("losses")??0,d=stat("ties","draws")??0,gf=stat("pointsFor","goalsFor"),ga=stat("pointsAgainst","goalsAgainst");rows.push([g,name,abbr,w,d,l,gf,ga]);}}return rows.length>=8?rows:null;}catch(err){return null;}}
 
-    /* Parse ESPN standings JSON → snapshot-style rows. Returns null if shape is unexpected. */
-    function parseLive(json) {
-      try {
-        const groups = json.children || (json.standings ? [json] : []);
-        const rows = [];
-        for (const grp of groups) {
-          const rawName = grp.abbreviation || grp.shortName || grp.name || "?";
-          const g = String(rawName).replace(/^group\s*/i, "").trim().charAt(0).toUpperCase() || "?";
-          const entries = (grp.standings && grp.standings.entries) || grp.entries || [];
-          for (const e of entries) {
-            const team = e.team || {};
-            const name = team.shortDisplayName || team.displayName || team.name || team.abbreviation || "?";
-            const abbr = String(team.abbreviation || name).slice(0, 3).toUpperCase();
-            const stat = (...names) => { for (const n of names) { const s = (e.stats || []).find(x => x.name === n || x.type === n || x.abbreviation === n); if (s && s.value != null) return Number(s.value); } return undefined; };
-            const w = stat("wins") ?? 0, l = stat("losses") ?? 0, d = stat("ties", "draws") ?? 0;
-            const gf = stat("pointsFor", "goalsFor"), ga = stat("pointsAgainst", "goalsAgainst");
-            rows.push([g, name, abbr, w, d, l, gf, ga]);
-          }
-        }
-        return rows.length >= 8 ? rows : null;
-      } catch (err) { return null; }
-    }
-
-    /* ════ ENGINE ════ */
+    /* ════ MATH / ENGINE ════ */
     const sigmoid=z=>1/(1+Math.exp(-z));
+    const logit=p=>{const q=Math.min(1-1e-6,Math.max(1e-6,p));return Math.log(q/(1-q));};
     const mean=a=>a.reduce((s,v)=>s+v,0)/a.length;
     const sd_=(a,m)=>Math.sqrt(mean(a.map(v=>(v-m)*(v-m)))||1);
     const dot=(a,b)=>a.reduce((s,v,i)=>s+v*b[i],0);
     const clamp=(x,lo,hi)=>Math.max(lo,Math.min(hi,x));
+    const softmax=a=>{const m=Math.max(...a);const e=a.map(x=>Math.exp(x-m));const s=e.reduce((p,q)=>p+q,0);return e.map(x=>x/s);};
     function randn(){let u=0,v=0;while(u===0)u=Math.random();while(v===0)v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
     function gam(k){if(k<1)return gam(1+k)*Math.pow(Math.random(),1/k);const d=k-1/3,c=1/Math.sqrt(9*d);while(true){let x,v;do{x=randn();v=1+c*x;}while(v<=0);v=v*v*v;const u=Math.random();if(u<1-.0331*x*x*x*x)return d*v;if(Math.log(u)<.5*x*x+d*(1-v+Math.log(v)))return d*v;}}
     const betaS=(a,b)=>{const x=gam(a),y=gam(b);return x/(x+y);};
@@ -96,129 +71,145 @@
     function bayesPost(t,pg=4,pr=.5){const a=pr*pg+t.bw,b=(1-pr)*pg+t.bl,m=a/(a+b);const sd=Math.sqrt((a*b)/((a+b)*(a+b)*(a+b+1)));return{a,b,mean:m,sd,lo:clamp(m-1.96*sd,0,1),hi:clamp(m+1.96*sd,0,1)};}
     const bayesMatch=(pA,pB)=>(pA*(1-pB))/(pA*(1-pB)+pB*(1-pA)||1e-9);
     const feats=(A,B)=>[(A.elo-B.elo)/400,A.wr-B.wr,(A.gd-B.gd)/3,(A.form-B.form)/5,0];
-    function trainML(){
-      const N=2500,X=[],y=[];
-      for(let i=0;i<N;i++){const sA=randn()*.8,sB=randn()*.8,eA=1500+sA*250,eB=1500+sB*250,h=[-1,0,1][Math.floor(Math.random()*3)];
-        y.push(Math.random()<1/(1+Math.pow(10,(eB-(eA+h*60))/400))?1:0);
-        X.push([(eA-eB)/400+randn()*.12,(sA-sB)*.18+randn()*.05,((sA-sB)*6)/10+randn()*.08,(sA-sB)*.16+randn()*.06,h]);}
-      const mns=[],sds=[];for(let j=0;j<5;j++){const c=X.map(r=>r[j]);const m=mean(c);mns.push(m);sds.push(sd_(c,m));}
-      const Xs=X.map(r=>r.map((v,j)=>(v-mns[j])/sds[j]));let w=[0,0,0,0,0],b=0;
-      for(let it=0;it<500;it++){const gw=[0,0,0,0,0];let gb=0;for(let i=0;i<N;i++){const e=sigmoid(dot(w,Xs[i])+b)-y[i];for(let j=0;j<5;j++)gw[j]+=e*Xs[i][j];gb+=e;}for(let j=0;j<5;j++)w[j]-=.3*gw[j]/N;b-=.3*gb/N;}
-      let cor=0;for(let i=0;i<N;i++){const p=sigmoid(dot(w,Xs[i])+b);if((p>.5?1:0)===y[i])cor++;}
-      return{w,b,mns,sds,acc:cor/N};
-    }
+    function trainML(){const N=2200,X=[],y=[];for(let i=0;i<N;i++){const sA=randn()*.8,sB=randn()*.8,eA=1500+sA*250,eB=1500+sB*250,h=[-1,0,1][Math.floor(Math.random()*3)];y.push(Math.random()<1/(1+Math.pow(10,(eB-(eA+h*60))/400))?1:0);X.push([(eA-eB)/400+randn()*.12,(sA-sB)*.18+randn()*.05,((sA-sB)*6)/10+randn()*.08,(sA-sB)*.16+randn()*.06,h]);}const mns=[],sds=[];for(let j=0;j<5;j++){const c=X.map(r=>r[j]);const m=mean(c);mns.push(m);sds.push(sd_(c,m));}const Xs=X.map(r=>r.map((v,j)=>(v-mns[j])/sds[j]));let w=[0,0,0,0,0],b=0;for(let it=0;it<450;it++){const gw=[0,0,0,0,0];let gb=0;for(let i=0;i<N;i++){const e=sigmoid(dot(w,Xs[i])+b)-y[i];for(let j=0;j<5;j++)gw[j]+=e*Xs[i][j];gb+=e;}for(let j=0;j<5;j++)w[j]-=.3*gw[j]/N;b-=.3*gb/N;}return{w,b,mns,sds};}
     const mlPred=(M,A,B)=>{const f=feats(A,B);return sigmoid(f.reduce((a,v,j)=>a+M.w[j]*((v-M.mns[j])/M.sds[j]),M.b));};
-    function seedOrder(n){let s=[1,2];while(s.length<n){const sum=s.length*2+1,nx=[];for(const x of s){nx.push(x);nx.push(sum-x);}s=nx;}return s;}
-    const stageName=m=>({32:"Round of 32",16:"Round of 16",8:"Quarterfinal",4:"Semifinal",2:"Final",1:"Champion"}[m]||`${m}`);
+    const ensemble=(A,B,M,posts)=>{const e=eloWin(A.elo,B.elo),b=bayesMatch(posts[A.id].mean,posts[B.id].mean),m=M?mlPred(M,A,B):(e+b)/2;return(e+b+m)/3;};
 
-    function buildTeams(rows){
-      return rows.map((r,i)=>{
-        const [g,name,abbr,w,d,l,gf,ga]=r, played=Math.max(1,w+d+l), pts=w*3+d;
-        const wr=(w+d/2)/played, ppg=pts/played;
-        const gd=(gf!=null&&ga!=null)?(gf-ga)/played:(ppg-1); // per-game goal diff (real if available, else proxy)
-        const elo=1500+(wr-.5)*240+(ppg-1)*40+clamp(gd,-4,4)*22;
-        return { id:i+1, g, name, abbr, w, d, l, pts, played, wr, ppg, gd, elo,
-          bw:w+d/2, bl:l+d/2, form:Math.round(wr*5), c:gc(g), rank:0 };
-      });
+    /* ── calibrated combined model (shrinkage + weighted blend + Platt + caps) ── */
+    const applyCal=(p,P)=>clamp(sigmoid(P.a*logit(p)+P.b),0.05,0.95);
+    function combined(A,B,M,posts,opt,P){
+      const base=ensemble(A,B,M,posts);
+      const n=opt.h2hOn?opt.n:0;
+      const pH2H=opt.pH2H;
+      const h2hAdj=(n/(n+P.k))*pH2H+(P.k/(n+P.k))*base;
+      const form=sigmoid(0.5*((A.form)-(B.form)));
+      const host=(HOSTS.has(A.abbr)?1:0)-(HOSTS.has(B.abbr)?1:0);
+      const home=sigmoid(0.5*host);
+      const raw=P.w[0]*base+P.w[1]*h2hAdj+P.w[2]*form+P.w[3]*home;
+      const fin=clamp(sigmoid(P.a*logit(raw)+P.b),0.05,0.95);
+      return{base,h2hAdj,form,home,host,raw,fin,n};
     }
-    function pow2Floor(list){let n=1;while(n*2<=list.length)n*=2;return [...list].sort((a,b)=>b.elo-a.elo).slice(0,n);}
-    function qualify(teams){
-      const byG={}; teams.forEach(t=>{(byG[t.g]=byG[t.g]||[]).push(t);});
-      Object.values(byG).forEach(g=>{g.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.wr-a.wr);g.forEach((t,i)=>t.rank=i+1);});
-      const top2=teams.filter(t=>t.rank<=2);
-      const thirds=teams.filter(t=>t.rank===3).sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.wr-a.wr).slice(0,8);
-      return pow2Floor([...top2,...thirds]);
+
+    /* ── metrics ── */
+    const brier=(P,Y)=>mean(P.map((p,i)=>(p-Y[i])*(p-Y[i])));
+    const logloss=(P,Y)=>mean(P.map((p,i)=>{const q=clamp(p,1e-9,1-1e-9);return -(Y[i]*Math.log(q)+(1-Y[i])*Math.log(1-q));}));
+    function ece(P,Y,bins=10){const N=P.length;let e=0;for(let b=0;b<bins;b++){const lo=b/bins,hi=(b+1)/bins;const idx=[];P.forEach((p,i)=>{if(p>=lo&&(p<hi||(b===bins-1&&p<=hi)))idx.push(i);});if(!idx.length)continue;const conf=mean(idx.map(i=>P[i])),acc=mean(idx.map(i=>Y[i]));e+=(idx.length/N)*Math.abs(acc-conf);}return e;}
+    function reliability(P,Y,bins=10){const out=[];for(let b=0;b<bins;b++){const lo=b/bins,hi=(b+1)/bins,idx=[];P.forEach((p,i)=>{if(p>=lo&&(p<hi||(b===bins-1&&p<=hi)))idx.push(i);});out.push(idx.length?{mid:(lo+hi)/2,obs:mean(idx.map(i=>Y[i])),n:idx.length}:{mid:(lo+hi)/2,obs:null,n:0});}return out;}
+
+    /* ── synthetic labelled set (offline-style training for PSO) ── */
+    function genData(M=1600){
+      const rows=[];
+      for(let i=0;i<M;i++){
+        const sA=randn(),sB=randn(),diff=sA-sB;
+        const trueP=sigmoid(1.3*diff);const y=Math.random()<trueP?1:0;
+        const base=sigmoid(1.9*diff+randn()*0.3);                 // overconfident + noisy base
+        const n=Math.floor(Math.random()*9);                       // 0..8 prior meetings
+        let pH2H=0.5;if(n>0){let s=0;for(let j=0;j<n;j++)s+=Math.random()<trueP?1:0;pH2H=s/n;} // noisy small-sample H2H
+        const form=sigmoid(1.1*diff+randn()*0.5);
+        const host=[-1,0,1][Math.floor(Math.random()*3)];const home=sigmoid(0.5*host);
+        rows.push({base,n,pH2H,form,home,y});
+      }
+      const cut=Math.floor(M*0.7);
+      return{train:rows.slice(0,cut),val:rows.slice(cut)};
     }
-    function seededBracket(teams){const s=[...teams].sort((a,b)=>b.elo-a.elo);return seedOrder(teams.length).map(x=>s[x-1]);}
-    function matchP(model,M,posts,A,B){if(model==="ml")return M?mlPred(M,A,B):.5;if(model==="bayes")return bayesMatch(posts[A.id].mean,posts[B.id].mean);return eloWin(A.elo,B.elo);}
-    function runMC(teams,M,nSims=8000,model="elo"){
-      const n=teams.length,R=Math.log2(n),order=seededBracket(teams),posts={};
-      teams.forEach(t=>posts[t.id]=bayesPost(t));
-      const fx={};teams.forEach(A=>{fx[A.id]={};teams.forEach(B=>{if(A.id!==B.id)fx[A.id][B.id]=matchP(model,M,posts,A,B);});});
+    const evalRow=(r,P)=>{const h=(r.n/(r.n+P.k))*r.pH2H+(P.k/(r.n+P.k))*r.base;const raw=P.w[0]*r.base+P.w[1]*h+P.w[2]*r.form+P.w[3]*r.home;return clamp(sigmoid(P.a*logit(raw)+P.b),0.05,0.95);};
+    const decode=z=>({w:softmax(z.slice(0,4)),k:Math.exp(z[4]),a:z[5],b:z[6]});
+
+    /* ── Particle Swarm Optimization ── */
+    function pso(obj,dim,lo,hi,nP=22,iters=70){
+      const pos=[],vel=[],pb=[],pbV=[];let gb=null,gbV=Infinity;
+      const rnd=(a,b)=>a+Math.random()*(b-a);
+      for(let i=0;i<nP;i++){const p=[];for(let d=0;d<dim;d++)p.push(rnd(lo[d],hi[d]));pos.push(p);vel.push(p.map(()=>0));const v=obj(p);pb.push(p.slice());pbV.push(v);if(v<gbV){gbV=v;gb=p.slice();}}
+      for(let it=0;it<iters;it++){const w=0.72-0.45*it/iters;
+        for(let i=0;i<nP;i++){for(let d=0;d<dim;d++){vel[i][d]=w*vel[i][d]+1.5*Math.random()*(pb[i][d]-pos[i][d])+1.5*Math.random()*(gb[d]-pos[i][d]);pos[i][d]=clamp(pos[i][d]+vel[i][d],lo[d],hi[d]);}const v=obj(pos[i]);if(v<pbV[i]){pbV[i]=v;pb[i]=pos[i].slice();}if(v<gbV){gbV=v;gb=pos[i].slice();}}}
+      return{best:gb,val:gbV};
+    }
+    function fitCalibration(){
+      const {train,val}=genData(1600);
+      const LO=[-4,-4,-4,-4,Math.log(0.5),0.15,-3],HI=[4,4,4,4,Math.log(40),4,3];
+      const obj=z=>{const P=decode(z);const pr=train.map(r=>evalRow(r,P)),y=train.map(r=>r.y);return brier(pr,y)+1.0*ece(pr,y);};
+      const {best}=pso(obj,7,LO,HI,22,70);
+      const params=decode(best);
+      const yv=val.map(r=>r.y);
+      const calP=val.map(r=>evalRow(r,params));
+      const uncalParams={...params,a:1,b:0};
+      const uncalP=val.map(r=>evalRow(r,uncalParams));
+      const relC=reliability(calP,yv),relU=reliability(uncalP,yv);
+      const rel=relC.map((c,i)=>({mid:c.mid,perfect:c.mid,cal:c.obs,uncal:relU[i].obs}));
+      return{params,rel,
+        cal:{brier:brier(calP,yv),logloss:logloss(calP,yv),ece:ece(calP,yv)},
+        uncal:{brier:brier(uncalP,yv),logloss:logloss(uncalP,yv),ece:ece(uncalP,yv)}};
+    }
+
+    /* ── teams / bracket / Monte Carlo ── */
+    function buildTeams(rows){return rows.map((r,i)=>{const[g,name,abbr,w,d,l,gf,ga]=r,played=Math.max(1,w+d+l),pts=w*3+d,wr=(w+d/2)/played,ppg=pts/played,gd=(gf!=null&&ga!=null)?(gf-ga)/played:(ppg-1),elo=1500+(wr-.5)*240+(ppg-1)*40+clamp(gd,-4,4)*22;return{id:i+1,g,name,abbr,w,d,l,pts,played,wr,ppg,gd,elo,bw:w+d/2,bl:l+d/2,form:Math.round(wr*5),c:gc(g),rank:0};});}
+    function pow2Floor(list){let n=1;while(n*2<=list.length)n*=2;return[...list].sort((a,b)=>b.elo-a.elo).slice(0,n);}
+    function qualify(teams){const byG={};teams.forEach(t=>{(byG[t.g]=byG[t.g]||[]).push(t);});Object.values(byG).forEach(g=>{g.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.wr-a.wr);g.forEach((t,i)=>t.rank=i+1);});const top2=teams.filter(t=>t.rank<=2);const thirds=teams.filter(t=>t.rank===3).sort((a,b)=>b.pts-a.pts||b.gd-a.gd).slice(0,8);return pow2Floor([...top2,...thirds]);}
+    function seededBracket(teams){const s=[...teams].sort((a,b)=>b.elo-a.elo);let o=[1,2];while(o.length<teams.length){const sum=o.length*2+1,nx=[];for(const x of o){nx.push(x);nx.push(sum-x);}o=nx;}return o.map(x=>s[x-1]);}
+    function runMC(teams,M,P,nSims=7000){
+      const n=teams.length,R=Math.log2(n),order=seededBracket(teams),posts={};teams.forEach(t=>posts[t.id]=bayesPost(t));
+      const fx={};teams.forEach(A=>{fx[A.id]={};teams.forEach(B=>{if(A.id!==B.id)fx[A.id][B.id]=applyCal(eloWin(A.elo,B.elo),P);});});
       const adv={};teams.forEach(t=>adv[t.id]=new Array(R+1).fill(0));
-      for(let s=0;s<nSims;s++){let alive=order.slice();const wins={};teams.forEach(t=>wins[t.id]=0);
-        while(alive.length>1){const nx=[];for(let i=0;i<alive.length;i+=2){const A=alive[i],B=alive[i+1];const w=Math.random()<fx[A.id][B.id]?A:B;wins[w.id]++;nx.push(w);}alive=nx;}
-        teams.forEach(t=>{for(let k=1;k<=wins[t.id];k++)adv[t.id][k]++;});}
-      const byId={};const top=Math.log2(n);teams.forEach(t=>{byId[t.id]={r16:(adv[t.id][Math.max(1,top-4)]/nSims)*100,qf:(adv[t.id][top-3]/nSims)*100,sf:(adv[t.id][top-2]/nSims)*100,final:(adv[t.id][top-1]/nSims)*100,champ:(adv[t.id][top]/nSims)*100};});
-      return {byId,posts};
-    }
-    function simOne(teams,M,model="elo"){
-      const posts={};teams.forEach(t=>posts[t.id]=bayesPost(t));let alive=seededBracket(teams);const rounds=[];
-      while(alive.length>1){const ms=[],nx=[];for(let i=0;i<alive.length;i+=2){const A=alive[i],B=alive[i+1];const pA=matchP(model,M,posts,A,B);const w=Math.random()<pA?A:B;ms.push({A,B,pA,win:w.id});nx.push(w);}rounds.push(ms);alive=nx;}
-      return {rounds,champ:alive[0]};
+      for(let s=0;s<nSims;s++){let alive=order.slice();const wins={};teams.forEach(t=>wins[t.id]=0);while(alive.length>1){const nx=[];for(let i=0;i<alive.length;i+=2){const A=alive[i],B=alive[i+1];const w=Math.random()<fx[A.id][B.id]?A:B;wins[w.id]++;nx.push(w);}alive=nx;}teams.forEach(t=>{for(let k=1;k<=wins[t.id];k++)adv[t.id][k]++;});}
+      const byId={},top=Math.log2(n);teams.forEach(t=>{byId[t.id]={r16:(adv[t.id][Math.max(1,top-4)]/nSims)*100,qf:(adv[t.id][top-3]/nSims)*100,sf:(adv[t.id][top-2]/nSims)*100,final:(adv[t.id][top-1]/nSims)*100,champ:(adv[t.id][top]/nSims)*100};});
+      return{byId};
     }
 
     /* ════ THEME ════ */
     const T={app:"#0b0b0d",surface:"#16151a",alt:"#201e25",border:"#2c2a33",text:"#f3ede1",sub:"#a89b8c",faint:"#6e6457"};
     const C={maroon:"#8c1d2c",maroonDeep:"#6d1422",gold:"#e3b23c",orange:"#ee7a3c",win:"#e3b23c",draw:"#8a8275",loss:"#a8313f"};
+    const DEFAULT_P={w:[0.62,0.18,0.12,0.08],k:6,a:1,b:0};
 
-    function BPEdLogo({size=38}){return(
-      <svg width={size} height={size} viewBox="0 0 100 100">
-        <circle cx="50" cy="50" r="48" fill="#6d1422"/><circle cx="50" cy="50" r="48" fill="none" stroke="#e3b23c" strokeWidth="4"/>
-        <circle cx="50" cy="50" r="35" fill="none" stroke="#e3b23c" strokeWidth="1.4" opacity=".55"/>
-        <path d="M50 24 C59 35 57 45 50 52 C43 45 41 35 50 24 Z" fill="#e3b23c"/>
-        <path d="M30 60 q20 14 40 0" fill="none" stroke="#e3b23c" strokeWidth="2.4" strokeLinecap="round"/>
-        <text x="50" y="80" textAnchor="middle" fontSize="17" fontWeight="700" fill="#e3b23c" fontFamily="Georgia,serif">BPEd</text>
-      </svg>);}
+    function BPEdLogo({size=38}){return(<svg width={size} height={size} viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="#6d1422"/><circle cx="50" cy="50" r="48" fill="none" stroke="#e3b23c" strokeWidth="4"/><circle cx="50" cy="50" r="35" fill="none" stroke="#e3b23c" strokeWidth="1.4" opacity=".55"/><path d="M50 24 C59 35 57 45 50 52 C43 45 41 35 50 24 Z" fill="#e3b23c"/><path d="M30 60 q20 14 40 0" fill="none" stroke="#e3b23c" strokeWidth="2.4" strokeLinecap="round"/><text x="50" y="80" textAnchor="middle" fontSize="17" fontWeight="700" fill="#e3b23c" fontFamily="Georgia,serif">BPEd</text></svg>);}
     function Card({children,className="",style={},...p}){return<div {...p} className={`rounded-2xl border ${className}`} style={{background:T.surface,borderColor:T.border,...style}}>{children}</div>;}
     function WDL({w,d,l,h=8}){const tot=w+d+l||1;return(<div className="flex w-full rounded-full overflow-hidden" style={{height:h}}><div style={{width:`${w/tot*100}%`,background:C.win}}/><div style={{width:`${d/tot*100}%`,background:C.draw}}/><div style={{width:`${l/tot*100}%`,background:C.loss}}/></div>);}
 
     function App(){
-      const [tab,setTab]=useState("standings");
+      const [tab,setTab]=useState("h2h");
       const [rows,setRows]=useState(SNAPSHOT);
-      const [source,setSource]=useState("snapshot"); // 'snapshot' | 'live'
-      const [status,setStatus]=useState("loading");   // 'loading' | 'ok' | 'error'
+      const [source,setSource]=useState("snapshot");
+      const [status,setStatus]=useState("loading");
       const [updated,setUpdated]=useState(SNAPSHOT_DATE);
       const [M,setM]=useState(null);
+      const [cal,setCal]=useState(null);          // {params, rel, cal, uncal}
       const [mc,setMc]=useState(null);
 
-      const fetchLive=useCallback(async()=>{
-        setStatus("loading");
-        try{
-          const ctrl=new AbortController();const to=setTimeout(()=>ctrl.abort(),9000);
-          const res=await fetch(API_URL,{signal:ctrl.signal});clearTimeout(to);
-          if(!res.ok)throw new Error("http "+res.status);
-          const json=await res.json();const parsed=parseLive(json);
-          if(parsed){setRows(parsed);setSource("live");setStatus("ok");setUpdated(new Date().toLocaleString());}
-          else throw new Error("unexpected shape");
-        }catch(err){setStatus("error"); /* keep whatever rows we have (snapshot) */ }
-      },[]);
-
+      const fetchLive=useCallback(async()=>{setStatus("loading");try{const ctrl=new AbortController();const to=setTimeout(()=>ctrl.abort(),9000);const res=await fetch(API_URL,{signal:ctrl.signal});clearTimeout(to);if(!res.ok)throw 0;const json=await res.json();const p=parseLive(json);if(p){setRows(p);setSource("live");setStatus("ok");setUpdated(new Date().toLocaleString());}else throw 0;}catch(e){setStatus("error");}},[]);
       useEffect(()=>{fetchLive();const id=setInterval(fetchLive,REFRESH_MS);return()=>clearInterval(id);},[fetchLive]);
 
       const all=useMemo(()=>buildTeams(rows),[rows]);
       const qualified=useMemo(()=>qualify(buildTeams(rows)),[rows]);
       const posts=useMemo(()=>{const p={};all.forEach(t=>p[t.id]=bayesPost(t));return p;},[all]);
-      useEffect(()=>{const id=setTimeout(()=>{const ml=M||trainML();if(!M)setM(ml);setMc(runMC(qualified,ml,8000,"elo"));},40);return()=>clearTimeout(id);},[qualified]);
 
-      const NAV=[["standings","Standings",BarChart3],["h2h","Head-to-Head",Swords],["predict","Prediction",Trophy]];
+      // train ML + fit PSO calibration once
+      useEffect(()=>{const id=setTimeout(()=>{setM(trainML());setCal(fitCalibration());},50);return()=>clearTimeout(id);},[]);
+      // Monte Carlo whenever qualifiers or calibration change
+      const P=cal?cal.params:DEFAULT_P;
+      useEffect(()=>{if(!M)return;const id=setTimeout(()=>setMc(runMC(qualified,M,P,7000)),20);return()=>clearTimeout(id);},[qualified,M,cal]);
+
+      const NAV=[["standings","Standings",BarChart3],["h2h","Head-to-Head",Swords],["predict","Prediction",Trophy],["calib","Calibration",Target]];
       const live=source==="live"&&status==="ok";
       return(
         <div className="min-h-screen" style={{background:T.app,color:T.text}}>
           <header className="sticky top-0 z-20 border-b backdrop-blur" style={{background:T.surface+"ee",borderColor:T.border}}>
             <div className="max-w-6xl mx-auto px-4 md:px-6 h-16 flex items-center gap-3">
               <BPEdLogo/>
-              <div className="mr-2"><div className="font-bold text-sm leading-tight">World Cup 2026 Predictor</div><div className="text-xs" style={{color:C.gold}}>BPEd · Elo · Bayesian · ML · Monte Carlo</div></div>
+              <div className="mr-2"><div className="font-bold text-sm leading-tight">WC 2026 Predictor <span style={{color:C.gold}}>v3</span></div><div className="text-xs" style={{color:C.gold}}>PSO-calibrated · shrinkage · Monte Carlo</div></div>
               <nav className="hidden md:flex gap-1">{NAV.map(([k,l,Ic])=>(<button key={k} onClick={()=>setTab(k)} className="px-3 py-1.5 text-sm font-medium rounded-xl flex items-center gap-1.5" style={tab===k?{background:C.maroon+"2e",color:C.gold}:{color:T.sub}}><Ic size={15}/>{l}</button>))}</nav>
               <div className="ml-auto flex items-center gap-2">
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold" style={{background:(live?C.gold:C.orange)+"26",color:live?C.gold:C.orange}}>
-                  {status==="loading"?<RefreshCw size={13} className="animate-spin"/>:live?<Wifi size={13}/>:<WifiOff size={13}/>}
-                  {status==="loading"?"Syncing…":live?"Live":"Snapshot"}
-                </span>
-                <button onClick={fetchLive} title="Refresh now" className="w-9 h-9 rounded-xl flex items-center justify-center" style={{background:T.alt}}><RefreshCw size={15} style={{color:T.sub}}/></button>
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold" style={{background:(live?C.gold:C.orange)+"26",color:live?C.gold:C.orange}}>{status==="loading"?<RefreshCw size={13} className="animate-spin"/>:live?<Wifi size={13}/>:<WifiOff size={13}/>}{status==="loading"?"Syncing…":live?"Live":"Snapshot"}</span>
+                <button onClick={fetchLive} className="w-9 h-9 rounded-xl flex items-center justify-center" style={{background:T.alt}}><RefreshCw size={15} style={{color:T.sub}}/></button>
               </div>
             </div>
             <div className="md:hidden flex gap-2 px-4 pb-3 overflow-x-auto">{NAV.map(([k,l,Ic])=>(<button key={k} onClick={()=>setTab(k)} className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium whitespace-nowrap" style={tab===k?{background:C.maroon,color:"#fff"}:{background:T.alt,color:T.sub}}><Ic size={14}/>{l}</button>))}</div>
           </header>
           <main className="max-w-6xl mx-auto p-4 md:p-6 lg:p-8">
-            <div className="mb-4 text-xs flex items-center gap-2" style={{color:T.faint}}>
-              {live?<><Wifi size={12} style={{color:C.gold}}/>Live from ESPN · updated {updated}</>:<><WifiOff size={12} style={{color:C.orange}}/>{status==="loading"?"Fetching live data…":`Live feed unavailable — showing snapshot from ${SNAPSHOT_DATE}`}</>}
-              <span>· auto-refreshes every 2 min</span>
-            </div>
+            <div className="mb-4 text-xs flex items-center gap-2 flex-wrap" style={{color:T.faint}}>{live?<><Wifi size={12} style={{color:C.gold}}/>Live from ESPN · {updated}</>:<><WifiOff size={12} style={{color:C.orange}}/>{status==="loading"?"Fetching…":`Snapshot · ${SNAPSHOT_DATE}`}</>}<span>· {cal?"calibration fitted":"fitting calibration…"}</span></div>
             <div key={tab} className="fade">
               {tab==="standings"&&<Standings all={all} qualified={qualified}/>}
-              {tab==="h2h"&&<H2H all={all} posts={posts} M={M}/>}
-              {tab==="predict"&&<Predict qualified={qualified} M={M} mc={mc}/>}
+              {tab==="h2h"&&<H2H all={all} posts={posts} M={M} P={P}/>}
+              {tab==="predict"&&<Predict qualified={qualified} mc={mc}/>}
+              {tab==="calib"&&<Calibration cal={cal}/>}
             </div>
           </main>
         </div>
@@ -226,150 +217,89 @@
     }
 
     function Standings({all,qualified}){
-      const qids=new Set(qualified.map(t=>t.id));
-      const groups={};all.forEach(t=>{(groups[t.g]=groups[t.g]||[]).push(t);});
-      Object.values(groups).forEach(g=>g.sort((a,b)=>b.pts-a.pts||b.gd-a.gd||b.wr-a.wr));
-      return(
-        <div className="space-y-5">
-          <div><div className="flex items-center gap-1.5 mb-1 text-xs font-semibold tracking-widest uppercase" style={{color:C.gold}}><BarChart3 size={13}/>Group Stage</div>
-            <h1 className="text-2xl font-bold tracking-tight">FIFA World Cup 2026 — standings</h1>
-            <p className="text-sm" style={{color:T.sub}}>Gold dot = projected to reach the knockout bracket.</p></div>
-          <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {Object.keys(groups).sort().map(g=>(
-              <Card key={g} className="p-4">
-                <div className="flex items-center gap-2 mb-3"><span className="w-6 h-6 rounded-lg flex items-center justify-center text-xs font-bold text-white" style={{background:gc(g)}}>{g}</span><span className="text-sm font-semibold">Group {g}</span></div>
-                <div className="space-y-1.5">
-                  {groups[g].map(t=>(
-                    <div key={t.id} className="flex items-center gap-2 text-sm">
-                      <span className="w-2 h-2 rounded-full shrink-0" style={{background:qids.has(t.id)?C.gold:T.faint}}/>
-                      <span className="flex-1 truncate" style={{fontWeight:qids.has(t.id)?600:400}}>{t.name}</span>
-                      <span className="font-mono text-xs" style={{color:T.faint}}>{t.w}-{t.d}-{t.l}</span>
-                      <span className="font-bold w-5 text-right" style={{color:C.gold}}>{t.pts}</span>
-                    </div>
-                  ))}
-                </div>
-              </Card>
-            ))}
-          </div>
-        </div>
-      );
+      const qids=new Set(qualified.map(t=>t.id));const groups={};all.forEach(t=>{(groups[t.g]=groups[t.g]||[]).push(t);});Object.values(groups).forEach(g=>g.sort((a,b)=>b.pts-a.pts||b.gd-a.gd));
+      return(<div className="space-y-5"><div><div className="flex items-center gap-1.5 mb-1 text-xs font-semibold tracking-widest uppercase" style={{color:C.gold}}><BarChart3 size={13}/>Group Stage</div><h1 className="text-2xl font-bold tracking-tight">FIFA World Cup 2026 — standings</h1><p className="text-sm" style={{color:T.sub}}>Gold dot = projected to reach the knockout bracket.</p></div>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">{Object.keys(groups).sort().map(g=>(<Card key={g} className="p-4"><div className="flex items-center gap-2 mb-3"><span className="w-6 h-6 rounded-lg flex items-center justify-center text-xs font-bold text-white" style={{background:gc(g)}}>{g}</span><span className="text-sm font-semibold">Group {g}</span></div><div className="space-y-1.5">{groups[g].map(t=>(<div key={t.id} className="flex items-center gap-2 text-sm"><span className="w-2 h-2 rounded-full shrink-0" style={{background:qids.has(t.id)?C.gold:T.faint}}/><span className="flex-1 truncate" style={{fontWeight:qids.has(t.id)?600:400}}>{t.name}</span><span className="font-mono text-xs" style={{color:T.faint}}>{t.w}-{t.d}-{t.l}</span><span className="font-bold w-5 text-right" style={{color:C.gold}}>{t.pts}</span></div>))}</div></Card>))}</div></div>);
     }
 
-    function H2H({all,posts,M}){
+    function H2H({all,posts,M,P}){
       const sorted=useMemo(()=>[...all].sort((a,b)=>b.elo-a.elo),[all]);
       const [aId,setAId]=useState(()=>sorted[0]?.id||1),[bId,setBId]=useState(()=>sorted[1]?.id||2);
+      const [h2hOn,setH2hOn]=useState(false);const [n,setN]=useState(3);const [ph,setPh]=useState(60);
       const [m,setM2]=useState(false);
       const A=all.find(x=>x.id===aId)||all[0],B=all.find(x=>x.id===bId)||all[1];
-      useEffect(()=>{setM2(false);const id=setTimeout(()=>setM2(true),80);return()=>clearTimeout(id);},[aId,bId]);
-      if(!A||!B||!posts[A.id]||!posts[B.id])return null;
-      const elo=eloWin(A.elo,B.elo)*100, ml=M?mlPred(M,A,B)*100:50, bayes=bayesMatch(posts[A.id].mean,posts[B.id].mean)*100;
-      const ens=(elo+ml+bayes)/3, pa=ens, pb=100-pa, spread=Math.max(elo,ml,bayes)-Math.min(elo,ml,bayes);
+      useEffect(()=>{setM2(false);const id=setTimeout(()=>setM2(true),60);return()=>clearTimeout(id);},[aId,bId,h2hOn,n,ph]);
+      if(!A||!B||!posts[A.id])return null;
+      const r=combined(A,B,M,posts,{h2hOn,n,pH2H:ph/100},P);
+      const pa=r.fin*100,pb=100-pa;
+      const comps=[["Base (Elo·ML·Bayes)",r.base,P.w[0],C.maroon],["H2H (shrunk)",r.h2hAdj,P.w[1],C.orange],["Recent form",r.form,P.w[2],C.gold],["Home edge",r.home,P.w[3],"#4f7bb0"]];
       const Sel=({v,on})=>(<select value={v} onChange={e=>on(+e.target.value)} className="px-2 py-1 rounded-lg outline-none text-sm" style={{background:T.alt,color:T.text}}>{all.map(x=>(<option key={x.id} value={x.id}>{x.name} ({x.g})</option>))}</select>);
       return(
         <div className="space-y-5">
-          <div><div className="flex items-center gap-1.5 mb-1 text-xs font-semibold tracking-widest uppercase" style={{color:C.gold}}><Swords size={13}/>Head-to-Head</div><h1 className="text-2xl font-bold tracking-tight">Compare two teams</h1></div>
+          <div className="flex items-end justify-between flex-wrap gap-3"><div><div className="flex items-center gap-1.5 mb-1 text-xs font-semibold tracking-widest uppercase" style={{color:C.gold}}><Swords size={13}/>Head-to-Head</div><h1 className="text-2xl font-bold tracking-tight">Calibrated matchup probability</h1></div>
+            <button onClick={()=>setH2hOn(!h2hOn)} className="flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-medium" style={{background:h2hOn?C.gold+"26":T.alt,color:h2hOn?C.gold:T.sub}}>{h2hOn?<ToggleRight size={18}/>:<ToggleLeft size={18}/>}H2H filter {h2hOn?"ON":"OFF"}</button>
+          </div>
           <Card className="p-6">
             <div className="flex items-center justify-between gap-2 mb-6"><Sel v={aId} on={setAId}/><span className="text-xs font-bold px-2 py-1 rounded-lg" style={{background:T.alt,color:T.sub}}>VS</span><Sel v={bId} on={setBId}/></div>
-            <div className="grid grid-cols-2 gap-4 mb-6">
-              {[A,B].map(t=>(
-                <div key={t.id} className="text-center">
-                  <div className="w-16 h-16 rounded-2xl mx-auto flex items-center justify-center text-xl font-bold text-white mb-2" style={{background:`linear-gradient(135deg,${t.c},${t.c}bb)`}}>{t.abbr}</div>
-                  <div className="font-bold">{t.name}</div><div className="text-xs mb-2" style={{color:T.faint}}>Group {t.g} · Rank #{t.rank} · {t.pts} pts</div>
-                  <WDL w={t.w} d={t.d} l={t.l}/><div className="flex justify-between text-xs mt-1" style={{color:T.sub}}><span>{t.w}W</span><span>{t.d}D</span><span>{t.l}L</span></div>
-                </div>
-              ))}
-            </div>
-            <div className="flex justify-between items-end mb-2">
-              <div><div className="text-2xl font-bold" style={{color:A.c}}>{pa.toFixed(0)}%</div><div className="text-xs" style={{color:T.faint}}>{A.name}</div></div>
-              <div className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{background:C.gold+"26",color:C.gold}}>Ensemble</div>
-              <div className="text-right"><div className="text-2xl font-bold" style={{color:B.c}}>{pb.toFixed(0)}%</div><div className="text-xs" style={{color:T.faint}}>{B.name}</div></div>
-            </div>
-            <div className="flex w-full h-4 rounded-full overflow-hidden" style={{background:T.alt}}><div style={{width:m?`${pa}%`:"0%",background:A.c,transition:"width .9s cubic-bezier(.22,1,.36,1)"}}/><div style={{width:m?`${pb}%`:"0%",background:B.c,transition:"width .9s cubic-bezier(.22,1,.36,1)"}}/></div>
+            {h2hOn&&(<div className="mb-6 p-4 rounded-xl" style={{background:T.alt}}>
+              <div className="text-xs mb-3" style={{color:T.sub}}>H2H history (illustrative — feed real prior-meeting data here in production)</div>
+              <div className="flex items-center gap-3 mb-3 text-sm"><span className="w-28" style={{color:T.faint}}>Prior meetings (n)</span><input type="range" min="0" max="10" value={n} onChange={e=>setN(+e.target.value)} className="flex-1"/><span className="w-8 font-mono font-bold" style={{color:C.gold}}>{n}</span></div>
+              <div className="flex items-center gap-3 text-sm"><span className="w-28" style={{color:T.faint}}>{A.abbr} H2H win %</span><input type="range" min="0" max="100" value={ph} onChange={e=>setPh(+e.target.value)} className="flex-1"/><span className="w-8 font-mono font-bold" style={{color:C.gold}}>{ph}</span></div>
+              <div className="text-xs mt-3" style={{color:T.faint}}>Shrinkage weight on raw H2H = n/(n+k) = <b style={{color:C.gold}}>{(n/(n+P.k)).toFixed(2)}</b> (k={P.k.toFixed(1)}). At n=0 the H2H term equals the base — so toggling never jumps.</div>
+            </div>)}
+            <div className="flex justify-between items-end mb-2"><div><div className="text-3xl font-bold" style={{color:A.c}}>{pa.toFixed(1)}%</div><div className="text-xs" style={{color:T.faint}}>{A.name}</div></div><div className="text-xs font-semibold px-2 py-0.5 rounded-full" style={{background:C.gold+"26",color:C.gold}}>Calibrated · capped 5–95%</div><div className="text-right"><div className="text-3xl font-bold" style={{color:B.c}}>{pb.toFixed(1)}%</div><div className="text-xs" style={{color:T.faint}}>{B.name}</div></div></div>
+            <div className="flex w-full h-4 rounded-full overflow-hidden" style={{background:T.alt}}><div style={{width:m?`${pa}%`:`50%`,background:A.c,transition:"width .6s cubic-bezier(.22,1,.36,1)"}}/><div style={{width:m?`${pb}%`:`50%`,background:B.c,transition:"width .6s cubic-bezier(.22,1,.36,1)"}}/></div>
           </Card>
           <Card className="p-5">
-            <div className="text-sm font-semibold mb-3 flex items-center gap-2">Model comparison · P({A.abbr} beats {B.abbr})</div>
-            <div className="grid sm:grid-cols-3 gap-4">
-              {[["Elo",elo,C.maroon],["Machine Learning",ml,C.orange],["Bayesian",bayes,C.gold]].map(([l,v,c])=>(
-                <div key={l} className="p-4 rounded-xl" style={{background:T.alt}}>
-                  <div className="text-sm font-semibold mb-2">{l}</div><div className="text-3xl font-bold mb-1" style={{color:c}}>{v.toFixed(0)}%</div>
-                  <div className="w-full rounded-full h-2" style={{background:T.surface}}><div className="h-2 rounded-full" style={{width:m?`${v}%`:"0%",background:c,transition:"width .8s"}}/></div>
-                </div>
-              ))}
+            <div className="text-sm font-semibold mb-4">Component breakdown → weighted blend → calibration</div>
+            <div className="space-y-3">{comps.map(([lbl,val,w,col])=>(
+              <div key={lbl} className="flex items-center gap-3 text-sm"><span className="w-44 shrink-0" style={{color:T.sub}}>{lbl}<span className="ml-1 text-xs" style={{color:T.faint}}>w={w.toFixed(2)}</span></span>
+                <div className="flex-1 rounded-full h-2.5" style={{background:T.alt}}><div className="h-2.5 rounded-full" style={{width:`${val*100}%`,background:col,transition:"width .6s"}}/></div>
+                <span className="w-12 text-right font-mono" style={{color:col}}>{(val*100).toFixed(0)}%</span></div>))}</div>
+            <div className="mt-4 pt-4 border-t flex items-center justify-between text-sm" style={{borderColor:T.border}}>
+              <span style={{color:T.sub}}>Raw blend → <span className="font-mono">{(r.raw*100).toFixed(1)}%</span> → Platt σ({P.a.toFixed(2)}·logit+{P.b.toFixed(2)}) → <b style={{color:C.gold}}>{pa.toFixed(1)}%</b></span>
             </div>
-            <div className="flex items-center gap-2 text-xs px-3 py-2 rounded-xl mt-4" style={{background:(spread<8?C.gold:C.orange)+"1f",color:spread<8?C.gold:C.orange}}>{spread<8?<Zap size={14}/>:<Info size={14}/>}{spread<8?`Consensus — models agree within ${spread.toFixed(0)} pts.`:`Models diverge by ${spread.toFixed(0)} pts — limited data, signals disagree.`}</div>
-            <div className="text-xs mt-3" style={{color:T.sub}}><b style={{color:T.text}}>Bayesian 95% interval</b> — {A.abbr}: {(posts[A.id].lo*100).toFixed(0)}–{(posts[A.id].hi*100).toFixed(0)}% · {B.abbr}: {(posts[B.id].lo*100).toFixed(0)}–{(posts[B.id].hi*100).toFixed(0)}%. Wider band = trust the point estimate less.</div>
           </Card>
         </div>
       );
     }
 
-    function Predict({qualified,M,mc}){
+    function Predict({qualified,mc}){
       const [bracket,setBracket]=useState(null);
-      useEffect(()=>{if(M&&qualified.length)setBracket(simOne(qualified,M,"elo"));},[M,qualified]);
-      if(!mc||!M)return<div className="text-center py-20 text-sm" style={{color:T.sub}}><RefreshCw size={20} className="animate-spin inline mr-2"/>Training models &amp; simulating 8,000 tournaments…</div>;
-      const ranked=[...qualified].sort((a,b)=>mc.byId[b.id].champ-mc.byId[a.id].champ);
-      const top=ranked[0];
+      if(!mc)return<div className="text-center py-20 text-sm" style={{color:T.sub}}><RefreshCw size={20} className="animate-spin inline mr-2"/>Simulating tournaments with calibrated probabilities…</div>;
+      const ranked=[...qualified].sort((a,b)=>mc.byId[b.id].champ-mc.byId[a.id].champ);const top=ranked[0];
       const chartData=ranked.slice(0,12).map(t=>({name:t.abbr,champ:mc.byId[t.id].champ,c:t.c}));
-      const lastThree=bracket?bracket.rounds.slice(-3):[];
-      return(
-        <div className="space-y-5">
-          <div className="flex items-end justify-between flex-wrap gap-3">
-            <div><div className="flex items-center gap-1.5 mb-1 text-xs font-semibold tracking-widest uppercase" style={{color:C.gold}}><Trophy size={13}/>Auto-generated Prediction</div>
-              <h1 className="text-2xl font-bold tracking-tight">WC 2026 knockout forecast</h1>
-              <p className="text-sm" style={{color:T.sub}}>{qualified.length} teams projected from current standings · 8,000 Monte Carlo simulations</p></div>
-            {bracket&&<button onClick={()=>setBracket(simOne(qualified,M,"elo"))} className="px-3 py-1.5 rounded-lg text-sm flex items-center gap-1.5" style={{background:T.alt}}><RefreshCw size={14}/>Re-roll bracket</button>}
-          </div>
-          <Card className="p-6 relative overflow-hidden" style={{background:`linear-gradient(135deg,${C.maroon},${C.maroonDeep} 60%,#2a0d12)`}}>
-            <div className="absolute right-6 -top-6 opacity-10"><Trophy size={130} className="text-white"/></div>
-            <div className="relative flex items-center gap-4">
-              <div className="w-16 h-16 rounded-2xl flex items-center justify-center text-xl font-bold text-white" style={{background:"#ffffff22",border:`1px solid ${C.gold}66`}}>{top.abbr}</div>
-              <div><div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold mb-1" style={{background:C.gold,color:"#1a0d05"}}><Crown size={13}/>Projected champion</div><div className="text-2xl font-bold text-white">{top.name}</div></div>
-              <div className="ml-auto text-right"><div className="text-4xl font-bold" style={{color:C.gold}}>{mc.byId[top.id].champ.toFixed(1)}%</div><div className="text-xs" style={{color:"#f3ede1aa"}}>title odds</div></div>
+      return(<div className="space-y-5">
+        <div><div className="flex items-center gap-1.5 mb-1 text-xs font-semibold tracking-widest uppercase" style={{color:C.gold}}><Trophy size={13}/>Auto-generated Prediction</div><h1 className="text-2xl font-bold tracking-tight">WC 2026 knockout forecast</h1><p className="text-sm" style={{color:T.sub}}>{qualified.length} teams · calibrated Monte Carlo (7,000 sims)</p></div>
+        <Card className="p-6 relative overflow-hidden" style={{background:`linear-gradient(135deg,${C.maroon},${C.maroonDeep} 60%,#2a0d12)`}}><div className="absolute right-6 -top-6 opacity-10"><Trophy size={130} className="text-white"/></div><div className="relative flex items-center gap-4"><div className="w-16 h-16 rounded-2xl flex items-center justify-center text-xl font-bold text-white" style={{background:"#ffffff22",border:`1px solid ${C.gold}66`}}>{top.abbr}</div><div><div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-semibold mb-1" style={{background:C.gold,color:"#1a0d05"}}><Crown size={13}/>Projected champion</div><div className="text-2xl font-bold text-white">{top.name}</div></div><div className="ml-auto text-right"><div className="text-4xl font-bold" style={{color:C.gold}}>{mc.byId[top.id].champ.toFixed(1)}%</div><div className="text-xs" style={{color:"#f3ede1aa"}}>title odds</div></div></div></Card>
+        <Card className="p-5"><div className="text-sm font-semibold mb-3">Championship probability — top 12</div><ResponsiveContainer width="100%" height={260}><BarChart data={chartData} margin={{top:5,right:10,left:-10,bottom:5}}><CartesianGrid strokeDasharray="3 3" stroke={T.border}/><XAxis dataKey="name" tick={{fontSize:11,fill:T.sub}}/><YAxis unit="%" tick={{fontSize:11,fill:T.sub}}/><Tooltip formatter={v=>`${v.toFixed(1)}%`} contentStyle={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:12,color:T.text}} cursor={{fill:T.alt}}/><Bar dataKey="champ" radius={[4,4,0,0]}>{chartData.map(d=><Cell key={d.name} fill={d.c}/>)}</Bar></BarChart></ResponsiveContainer></Card>
+        <Card className="p-5 overflow-x-auto"><div className="text-sm font-semibold mb-3">Advancement probabilities — top 16</div><table className="w-full text-sm"><thead><tr className="text-left" style={{color:T.sub}}><th className="py-1.5 pr-3">Team</th><th className="px-2 text-right">R16</th><th className="px-2 text-right">QF</th><th className="px-2 text-right">SF</th><th className="px-2 text-right">Final</th><th className="px-2 text-right">Champ</th></tr></thead><tbody>{ranked.slice(0,16).map((t,i)=>(<tr key={t.id} style={{borderTop:`1px solid ${T.border}`,background:i===0?C.gold+"12":"transparent"}}><td className="py-1.5 pr-3"><span className="inline-flex items-center gap-2"><span className="w-2.5 h-2.5 rounded-full" style={{background:t.c}}/>{t.name}<span className="text-xs" style={{color:T.faint}}>({t.g})</span></span></td>{["r16","qf","sf","final","champ"].map(k=><td key={k} className="px-2 text-right font-mono" style={k==="champ"?{color:C.gold,fontWeight:700}:{}}>{mc.byId[t.id][k].toFixed(1)}%</td>)}</tr>))}</tbody></table></Card>
+        <div className="text-xs rounded-xl px-3 py-2 flex items-center gap-2" style={{background:C.orange+"14",color:C.orange,border:`1px solid ${C.orange}33`}}><Bot size={14}/>Matchup probabilities pass through the PSO-fitted calibration map. Long-run frequencies, never guarantees.</div>
+      </div>);
+    }
+
+    function Calibration({cal}){
+      if(!cal)return<div className="text-center py-20 text-sm" style={{color:T.sub}}><RefreshCw size={20} className="animate-spin inline mr-2"/>Running Particle Swarm Optimization…</div>;
+      const {params:P,rel,cal:cc,uncal:uu}=cal;
+      const wlabels=["Base","H2H","Form","Home"];
+      const metric=(lbl,u,c,better="lower")=>(<tr style={{borderTop:`1px solid ${T.border}`}}><td className="py-1.5 pr-3" style={{color:T.sub}}>{lbl}</td><td className="px-3 text-right font-mono">{u.toFixed(4)}</td><td className="px-3 text-right font-mono" style={{color:C.gold,fontWeight:700}}>{c.toFixed(4)}</td><td className="px-3 text-right text-xs" style={{color:c<u?C.gold:T.faint}}>{c<u?"improved":"—"}</td></tr>);
+      return(<div className="space-y-5">
+        <div><div className="flex items-center gap-1.5 mb-1 text-xs font-semibold tracking-widest uppercase" style={{color:C.gold}}><Target size={13}/>PSO Calibration</div><h1 className="text-2xl font-bold tracking-tight">Probability calibration</h1><p className="text-sm" style={{color:T.sub}}>Particle Swarm Optimization fitted weights, shrinkage k, and Platt (a,b) to minimise Brier + ECE on held-out data.</p></div>
+        <div className="grid md:grid-cols-2 gap-4">
+          <Card className="p-5"><div className="text-sm font-semibold mb-3">Reliability diagram (validation)</div>
+            <ResponsiveContainer width="100%" height={260}><LineChart data={rel} margin={{top:5,right:10,left:-10,bottom:5}}><CartesianGrid strokeDasharray="3 3" stroke={T.border}/><XAxis dataKey="mid" type="number" domain={[0,1]} tickFormatter={v=>v.toFixed(1)} tick={{fontSize:11,fill:T.sub}}/><YAxis domain={[0,1]} tickFormatter={v=>v.toFixed(1)} tick={{fontSize:11,fill:T.sub}}/><Tooltip formatter={v=>v==null?"—":(v*100).toFixed(0)+"%"} contentStyle={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:12,color:T.text}}/><Legend wrapperStyle={{fontSize:11}}/><Line dataKey="perfect" name="Perfect" stroke={T.faint} strokeDasharray="4 4" dot={false}/><Line dataKey="uncal" name="Before" stroke={C.orange} strokeWidth={2} connectNulls dot={{r:2}}/><Line dataKey="cal" name="After" stroke={C.gold} strokeWidth={2} connectNulls dot={{r:2}}/></LineChart></ResponsiveContainer>
+            <p className="text-xs mt-1" style={{color:T.faint}}>Closer to the dashed diagonal = better calibrated. Gold (after) hugs it more tightly than orange (before).</p>
+          </Card>
+          <Card className="p-5"><div className="text-sm font-semibold mb-3">Quality metrics (lower is better)</div>
+            <table className="w-full text-sm"><thead><tr className="text-left" style={{color:T.faint}}><th className="py-1.5 pr-3"></th><th className="px-3 text-right">Before</th><th className="px-3 text-right">After</th><th className="px-3 text-right"></th></tr></thead><tbody>{metric("Brier score",uu.brier,cc.brier)}{metric("Log loss",uu.logloss,cc.logloss)}{metric("Expected Calib. Error",uu.ece,cc.ece)}</tbody></table>
+            <div className="mt-4 pt-4 border-t" style={{borderColor:T.border}}><div className="text-sm font-semibold mb-3">Fitted parameters</div>
+              <div className="space-y-2">{P.w.map((w,i)=>(<div key={i} className="flex items-center gap-2 text-sm"><span className="w-12" style={{color:T.sub}}>{wlabels[i]}</span><div className="flex-1 rounded-full h-2" style={{background:T.alt}}><div className="h-2 rounded-full" style={{width:`${w*100}%`,background:C.gold}}/></div><span className="w-12 text-right font-mono">{w.toFixed(2)}</span></div>))}</div>
+              <div className="grid grid-cols-3 gap-2 mt-3 text-center">{[["k (shrink)",P.k.toFixed(1)],["a (temp)",P.a.toFixed(2)],["b (bias)",P.b.toFixed(2)]].map(([l,v])=>(<div key={l} className="p-2 rounded-lg" style={{background:T.alt}}><div className="text-xs" style={{color:T.faint}}>{l}</div><div className="font-bold" style={{color:C.gold}}>{v}</div></div>))}</div>
             </div>
           </Card>
-          <Card className="p-5">
-            <div className="text-sm font-semibold mb-3">Championship probability — top 12</div>
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={chartData} margin={{top:5,right:10,left:-10,bottom:5}}>
-                <CartesianGrid strokeDasharray="3 3" stroke={T.border}/><XAxis dataKey="name" tick={{fontSize:11,fill:T.sub}}/><YAxis unit="%" tick={{fontSize:11,fill:T.sub}}/>
-                <Tooltip formatter={v=>`${v.toFixed(1)}%`} contentStyle={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:12,color:T.text}} cursor={{fill:T.alt}}/>
-                <Bar dataKey="champ" radius={[4,4,0,0]}>{chartData.map(d=><Cell key={d.name} fill={d.c}/>)}</Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </Card>
-          <Card className="p-5 overflow-x-auto">
-            <div className="text-sm font-semibold mb-3">Advancement probabilities — top 16</div>
-            <table className="w-full text-sm">
-              <thead><tr className="text-left" style={{color:T.sub}}><th className="py-1.5 pr-3">Team</th><th className="px-2 text-right">R16</th><th className="px-2 text-right">QF</th><th className="px-2 text-right">SF</th><th className="px-2 text-right">Final</th><th className="px-2 text-right">Champ</th></tr></thead>
-              <tbody>{ranked.slice(0,16).map((t,i)=>(
-                <tr key={t.id} style={{borderTop:`1px solid ${T.border}`,background:i===0?C.gold+"12":"transparent"}}>
-                  <td className="py-1.5 pr-3"><span className="inline-flex items-center gap-2"><span className="w-2.5 h-2.5 rounded-full" style={{background:t.c}}/>{t.name}<span className="text-xs" style={{color:T.faint}}>({t.g})</span></span></td>
-                  {["r16","qf","sf","final","champ"].map(k=><td key={k} className="px-2 text-right font-mono" style={k==="champ"?{color:C.gold,fontWeight:700}:{}}>{mc.byId[t.id][k].toFixed(1)}%</td>)}
-                </tr>))}</tbody>
-            </table>
-          </Card>
-          {bracket&&(
-            <Card className="p-6 overflow-x-auto">
-              <div className="text-sm font-semibold mb-4">One simulated knockout path (quarterfinals → final)</div>
-              <div className="flex gap-4 min-w-max">
-                {lastThree.map((rnd,ri)=>(
-                  <div key={ri} className="flex flex-col justify-around gap-3">
-                    <div className="text-xs text-center mb-1" style={{color:T.faint}}>{["Quarterfinal","Semifinal","Final"][ri]}</div>
-                    {rnd.map((m,mi)=>(
-                      <div key={mi} className="rounded-xl border overflow-hidden w-36 text-xs" style={{borderColor:T.border}}>
-                        {[m.A,m.B].map(t=>{const won=m.win===t.id;return(<div key={t.id} className="flex items-center justify-between px-2.5 py-1.5" style={won?{background:t.c+"22"}:{}}><span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-full" style={{background:t.c}}/><span style={{color:won?T.text:T.faint,fontWeight:won?700:400}}>{t.abbr}</span></span></div>);})}
-                      </div>
-                    ))}
-                  </div>
-                ))}
-                <div className="flex flex-col justify-center"><div className="text-xs text-center mb-1" style={{color:T.faint}}>Champion</div>
-                  <div className="rounded-2xl p-4 text-center" style={{background:`linear-gradient(135deg,${C.maroon},${C.gold})`,color:"#1a0d05"}}><Crown size={20} className="mx-auto mb-1"/><div className="font-bold">{bracket.champ.abbr}</div></div></div>
-              </div>
-            </Card>
-          )}
-          <div className="text-xs rounded-xl px-3 py-2 flex items-center gap-2" style={{background:C.orange+"14",color:C.orange,border:`1px solid ${C.orange}33`}}><Bot size={14}/>Qualifiers seeded by model rating, not official fixture pairings. Probabilities are long-run frequencies, never guarantees.</div>
         </div>
-      );
+        <div className="text-xs rounded-xl px-3 py-2 flex items-center gap-2" style={{background:C.gold+"14",color:C.gold,border:`1px solid ${C.gold}33`}}><Info size={14}/>Fitted in-browser on a synthetic labelled set (we can't grade calibration on WC games that haven't happened yet). In production, refit nightly on real match history and ship (w, k, a, b) as constants.</div>
+      </div>);
     }
 
     createRoot(document.getElementById("root")).render(<App/>);
